@@ -202,18 +202,13 @@ function simulateSeason(drafted, formation, season, replacedClub) {
   const results = [];
   let w=0, d=0, l=0, gf=0, ga=0;
   for (const game of schedule) {
-    // Fresh per-game ratings: group avg + star contribution, weight drawn each game
     const gr = gameRatings(base);
-    const homeBonus = game.home ? 2 : -1;
-
-    const attDiff = (gr.att + homeBonus) - game.stats.def;
-    const noise1 = (Math.random() + Math.random() - 1) * 1.8;
-    const myGoals = Math.max(0, Math.round(1.15 + attDiff * 0.055 + noise1));
-
-    const defDiff = gr.def - game.stats.att;
-    const noise2 = (Math.random() + Math.random() - 1) * 1.8;
-    const oppGoals = Math.max(0, Math.round(1.15 - defDiff * 0.055 + noise2));
-
+    const hb = game.home ? 1.5 : -0.5;
+    const myXg  = 1.1 + (gr.att  - game.stats.def) * 0.065 + hb * 0.15;
+    const oppXg = 1.1 + (game.stats.att - gr.def)   * 0.065 - hb * 0.10;
+    const N = 1.6;
+    const myGoals  = Math.max(0, Math.round(myXg  + (Math.random()+Math.random()-1)*N));
+    const oppGoals = Math.max(0, Math.round(oppXg + (Math.random()+Math.random()-1)*N));
     gf += myGoals; ga += oppGoals;
     if (myGoals > oppGoals) { w++; results.push({ r:"W", opp: game.club, mg: myGoals, og: oppGoals, home: game.home }); }
     else if (myGoals === oppGoals) { d++; results.push({ r:"D", opp: game.club, mg: myGoals, og: oppGoals, home: game.home }); }
@@ -838,33 +833,50 @@ function ResultsScreen({ formation, season, replacedClub, drafted, config, onRes
   const [showAll, setShowAll] = useState(false);
   const slots = FORMATIONS[formation];
 
-  // Build league table: us + 19 opponents
-  // Each opponent plays 38 games: 2 vs every other club in the league
-  // We use a deterministic pseudo-random based on club name to get consistent results
-  const tableRows = [
-    { club:"Your XI", pts:result.pts, w:result.w, d:result.d, l:result.l, gf:result.gf, ga:result.ga, gd:result.gd, us:true },
-    ...result.opponents.map(([club, stats]) => {
-      // Simple seeded RNG
-      let seed = club.split("").reduce((a,c)=>a+c.charCodeAt(0),0) * 1000 + Math.round(stats.avg*10);
-      const rng = () => { seed = (seed * 1664525 + 1013904223) & 0xffffffff; return (seed>>>0)/0xffffffff; };
-      let w=0,d=0,l=0,gf=0,ga=0;
-      // 38 games: home vs each of 18 other opponents + away vs each of 18 + 1 home vs us + 1 away vs us
-      // Simplified: 38 games total using their att/def vs a league-average opponent (74/74)
-      for (let g=0;g<19;g++) {
-        // Away game
-        const myg_a = Math.max(0,Math.round(1.05 + (stats.att-74)*0.055 + (rng()-0.5)*2.2));
-        const opg_a = Math.max(0,Math.round(1.25 - (stats.def-74)*0.055 + (rng()-0.5)*2.2));
-        if (myg_a>opg_a) w++; else if (myg_a===opg_a) d++; else l++;
-        gf+=myg_a; ga+=opg_a;
-        // Home game
-        const myg_h = Math.max(0,Math.round(1.35 + (stats.att-74)*0.055 + (rng()-0.5)*2.2));
-        const opg_h = Math.max(0,Math.round(1.05 - (stats.def-74)*0.055 + (rng()-0.5)*2.2));
-        if (myg_h>opg_h) w++; else if (myg_h===opg_h) d++; else l++;
-        gf+=myg_h; ga+=opg_h;
-      }
-      return { club, pts:w*3+d, w, d, l, gf, ga, gd:gf-ga, us:false };
-    })
-  ].sort((a,b) => b.pts-a.pts || b.gd-a.gd || b.gf-a.gf);
+  // Build league table by simulating every head-to-head match properly
+  // so total Ws = total Ls and Ds balance across the table
+  const allClubs = [
+    { club:"Your XI", att:result.my.att, def:result.my.def, us:true },
+    ...result.opponents.map(([club, stats]) => ({ club, att:stats.att, def:stats.def, us:false })),
+  ];
+
+  // Seeded RNG so table is stable on re-render
+  let _seed = allClubs.reduce((s,c)=>s+c.club.length*c.att,0)|0;
+  const srng = () => { _seed = (_seed * 1664525 + 1013904223) & 0xffffffff; return (_seed>>>0)/0xffffffff; };
+
+  // Init records
+  const records = {};
+  allClubs.forEach(c => { records[c.club] = { club:c.club, w:0,d:0,l:0,gf:0,ga:0, us:c.us }; });
+
+  // Simulate every pair home + away
+  for (let i = 0; i < allClubs.length; i++) {
+    for (let j = 0; j < allClubs.length; j++) {
+      if (i === j) continue;
+      const home = allClubs[i], away = allClubs[j];
+      const hb = 1.5;
+      const hxg = 1.1 + (home.att - away.def) * 0.065 + hb * 0.15;
+      const axg = 1.1 + (away.att - home.def) * 0.065 - hb * 0.10;
+      const N = 1.6;
+      const hg = Math.max(0, Math.round(hxg + (srng()+srng()-1)*N));
+      const ag = Math.max(0, Math.round(axg + (srng()+srng()-1)*N));
+      records[home.club].gf += hg; records[home.club].ga += ag;
+      records[away.club].gf += ag; records[away.club].ga += hg;
+      if (hg > ag) { records[home.club].w++; records[away.club].l++; }
+      else if (hg === ag) { records[home.club].d++; records[away.club].d++; }
+      else { records[home.club].l++; records[away.club].w++; }
+    }
+  }
+
+  // Override Your XI record with actual simulated result
+  records["Your XI"].w  = result.w;
+  records["Your XI"].d  = result.d;
+  records["Your XI"].l  = result.l;
+  records["Your XI"].gf = result.gf;
+  records["Your XI"].ga = result.ga;
+
+  const tableRows = Object.values(records)
+    .map(r => ({ ...r, pts: r.w*3+r.d, gd: r.gf-r.ga }))
+    .sort((a,b) => b.pts-a.pts || b.gd-a.gd || b.gf-a.gf);
 
   const ourPos = tableRows.findIndex(r=>r.us) + 1;
   const badge = getBadge(result, ourPos);
